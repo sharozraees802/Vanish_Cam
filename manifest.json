@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Vanish Cam (Snap to Disappear)",
+  "version": "0.1.0",
+  "description": "Snap your fingers and disappear from your webcam feed.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://meet.google.com/*",
+        "https://*.zoom.us/*",
+        "https://teams.microsoft.com/*",
+        "https://teams.live.com/*"
+      ],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ]
+}
