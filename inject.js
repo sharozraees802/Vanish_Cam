@@ -1,20 +1,29 @@
-// Vanish Cam - runs in the page's MAIN world and wraps getUserMedia.
-// Hotkeys:  Alt+Shift+B = capture background (3s countdown, step out of frame)
-//           Alt+Shift+V = toggle vanish manually (for testing)
-// Snap your fingers = toggle vanish.
+// Vanish Cam v2 - runs in the page's MAIN world and wraps getUserMedia.
+//
+// Hotkeys (Windows/Linux):  Alt + Shift + B  = capture background (3s countdown)
+//                           Alt + Shift + V  = toggle vanish
+// Hotkeys (Mac):            Option(⌥) + Shift + B = capture background
+//                           Option(⌥) + Shift + V = toggle vanish
+// Or just snap your fingers = toggle vanish.
 (() => {
   if (window.__vanishCamInstalled) return;
   window.__vanishCamInstalled = true;
 
+  const IS_MAC = /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
+  const MOD = IS_MAC ? 'Option(⌥)+Shift' : 'Alt+Shift';
+
   const CFG = {
-    maxWidth: 640,        // processing width (lower = faster)
-    diffThreshold: 60,    // pixel difference vs background to count as "person"
-    dilateRadius: 3,      // grows mask to cover edges/halo
-    vanishMs: 1800,       // length of the dissolve effect
-    captureDelayMs: 3000, // time to step out of frame
-    captureFrames: 20,    // frames averaged for the background
-    snapMinEnergy: 55,    // min high-freq energy (0-255) to count as snap
-    snapRatio: 3.0,       // spike vs running average
+    outMaxWidth: 1280,     // OUTPUT resolution (full quality, no blur)
+    analysisWidth: 320,    // mask is computed at this width (fast)
+    diffThreshold: 60,     // pixel difference vs background to count as "person"
+    erodeRadius: 1,        // removes speckle noise from the mask
+    dilateRadius: 3,       // grows mask to cover edges (in analysis pixels)
+    vanishMs: 1800,        // length of the dissolve effect
+    captureDelayMs: 3000,  // time to step out of frame
+    captureFrames: 20,     // frames averaged for the background
+    fps: 30,
+    snapMinEnergy: 55,
+    snapRatio: 3.0,
     snapCooldownMs: 1500,
   };
 
@@ -22,7 +31,7 @@
   let currentProcessor = null;
   let lastSnap = 0;
 
-  // ---------- tiny on-screen toast ----------
+  // ---------- toast ----------
   let toastEl = null, toastTimer = null;
   function toast(msg) {
     if (!document.body) return;
@@ -44,13 +53,13 @@
 
   function toggleVanish() {
     if (!currentProcessor || !currentProcessor.hasBackground()) {
-      toast('Pehle background capture karo: Alt+Shift+B');
+      toast(`Pehle background capture karo: ${MOD}+B`);
       return;
     }
     state.target = state.target ? 0 : 1;
   }
 
-  // ---------- snap detection (microphone, high-frequency spike) ----------
+  // ---------- snap detection ----------
   function startSnapDetector(stream) {
     const AC = window.AudioContext || window.webkitAudioContext;
     const ctx = new AC();
@@ -84,32 +93,46 @@
     }, 20);
   }
 
-  // ---------- video processing ----------
-  function dilate(src, tmp, dst, W, H, r) {
+  // ---------- morphology (separable box, binary) ----------
+  // mode 1 = dilate, mode 0 = erode
+  function morph(src, tmp, dst, W, H, r, dilateMode) {
+    const hit = dilateMode ? 1 : 0;
     for (let y = 0; y < H; y++) {
       const row = y * W;
       for (let x = 0; x < W; x++) {
-        let v = 0;
+        let v = dilateMode ? 0 : 1;
         const x0 = Math.max(0, x - r), x1 = Math.min(W - 1, x + r);
-        for (let xx = x0; xx <= x1; xx++) if (src[row + xx]) { v = 1; break; }
+        for (let xx = x0; xx <= x1; xx++) {
+          if (src[row + xx] === hit) { v = hit; break; }
+        }
         tmp[row + x] = v;
       }
     }
     for (let x = 0; x < W; x++) {
       for (let y = 0; y < H; y++) {
-        let v = 0;
+        let v = dilateMode ? 0 : 1;
         const y0 = Math.max(0, y - r), y1 = Math.min(H - 1, y + r);
-        for (let yy = y0; yy <= y1; yy++) if (tmp[yy * W + x]) { v = 1; break; }
+        for (let yy = y0; yy <= y1; yy++) {
+          if (tmp[yy * W + x] === hit) { v = hit; break; }
+        }
         dst[y * W + x] = v;
       }
     }
   }
 
+  function makeCanvas(w, h, opts) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    return [c, c.getContext('2d', opts)];
+  }
+
+  // ---------- video processing ----------
   function createProcessor(videoTrack) {
     const s = videoTrack.getSettings();
     const srcW = s.width || 1280, srcH = s.height || 720;
-    const scale = Math.min(1, CFG.maxWidth / srcW);
-    const W = Math.round(srcW * scale), H = Math.round(srcH * scale);
+    const sc = Math.min(1, CFG.outMaxWidth / srcW);
+    const W = Math.round(srcW * sc), H = Math.round(srcH * sc);
+    const aw = CFG.analysisWidth, ah = Math.round((aw * H) / W);
 
     const video = document.createElement('video');
     video.muted = true;
@@ -117,26 +140,32 @@
     video.srcObject = new MediaStream([videoTrack]);
     video.play().catch(() => {});
 
-    const canvas = document.createElement('canvas');
-    canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    // full-res output + full-res background (so no blur)
+    const [outCv, out] = makeCanvas(W, H);
+    const [bgCv, bgCtx] = makeCanvas(W, H);
+    const [layerCv, layer] = makeCanvas(W, H);
+    // low-res analysis
+    const [, small] = makeCanvas(aw, ah, { willReadFrequently: true });
+    const [bgSmallCv, bgSmallCtx] = makeCanvas(aw, ah, { willReadFrequently: true });
+    const [maskCv, maskCtx] = makeCanvas(aw, ah);
+    const maskImg = maskCtx.createImageData(aw, ah);
 
-    // per-pixel dissolve threshold: random + left-to-right sweep
-    const noise = new Float32Array(W * H);
-    for (let y = 0; y < H; y++)
-      for (let x = 0; x < W; x++) noise[y * W + x] = Math.random() * 0.5 + (x / W) * 0.5;
+    const N = aw * ah;
+    const raw = new Uint8Array(N), tmp = new Uint8Array(N);
+    const eroded = new Uint8Array(N), mask = new Uint8Array(N);
 
-    const raw = new Uint8Array(W * H);
-    const tmp = new Uint8Array(W * H);
-    const mask = new Uint8Array(W * H);
+    // dissolve threshold: random + left-to-right sweep
+    const noise = new Float32Array(N);
+    for (let y = 0; y < ah; y++)
+      for (let x = 0; x < aw; x++) noise[y * aw + x] = Math.random() * 0.5 + (x / aw) * 0.5;
 
-    let bg = null;           // Uint8ClampedArray RGBA
-    let capture = null;      // { acc, count, startAt }
+    let bgSmall = null;      // low-res background pixels (for diffing)
+    let capture = null;      // { count, startAt }
     let lastT = performance.now();
 
     function startCapture() {
       toast('Frame se bahar jao... 3 second');
-      capture = { acc: null, count: 0, startAt: performance.now() + CFG.captureDelayMs };
+      capture = { count: 0, startAt: performance.now() + CFG.captureDelayMs };
     }
 
     function tick() {
@@ -145,59 +174,79 @@
       const dt = now - lastT;
       lastT = now;
 
-      ctx.drawImage(video, 0, 0, W, H);
-      const frame = ctx.getImageData(0, 0, W, H);
-      const d = frame.data;
+      // 1) always draw the live frame at full resolution
+      out.globalCompositeOperation = 'source-over';
+      out.drawImage(video, 0, 0, W, H);
 
-      // background capture (averaged for less noise)
+      // 2) background capture: running average done on GPU, full-res
       if (capture && now >= capture.startAt) {
-        if (!capture.acc) capture.acc = new Float32Array(W * H * 3);
-        for (let i = 0, k = 0; i < W * H; i++, k += 3) {
-          const j = i * 4;
-          capture.acc[k] += d[j]; capture.acc[k + 1] += d[j + 1]; capture.acc[k + 2] += d[j + 2];
-        }
+        bgCtx.globalAlpha = 1 / (capture.count + 1);
+        bgCtx.drawImage(video, 0, 0, W, H);
+        bgCtx.globalAlpha = 1;
         capture.count++;
         if (capture.count >= CFG.captureFrames) {
-          bg = new Uint8ClampedArray(W * H * 4);
-          for (let i = 0, k = 0; i < W * H; i++, k += 3) {
-            const j = i * 4;
-            bg[j] = capture.acc[k] / capture.count;
-            bg[j + 1] = capture.acc[k + 1] / capture.count;
-            bg[j + 2] = capture.acc[k + 2] / capture.count;
-            bg[j + 3] = 255;
-          }
+          bgSmallCtx.drawImage(bgCv, 0, 0, aw, ah);
+          bgSmall = bgSmallCtx.getImageData(0, 0, aw, ah).data;
           capture = null;
-          toast('Background capture ho gaya. Ab snap karo!');
+          toast(`Background capture ho gaya. Ab snap karo ya ${MOD}+V dabao!`);
         }
       }
 
-      // animate progress
+      // 3) progress animation
       const dir = state.target > state.progress ? 1 : state.target < state.progress ? -1 : 0;
-      state.progress = Math.min(1, Math.max(0, state.progress + dir * dt / CFG.vanishMs));
+      state.progress = Math.min(1, Math.max(0, state.progress + (dir * dt) / CFG.vanishMs));
 
-      if (bg && state.progress > 0) {
-        for (let i = 0; i < W * H; i++) {
+      // 4) build mask at low-res, composite at full-res
+      if (bgSmall && state.progress > 0) {
+        small.drawImage(video, 0, 0, aw, ah);
+        const d = small.getImageData(0, 0, aw, ah).data;
+
+        // pass 1: estimate global brightness shift (auto-exposure) from "background-like" pixels
+        let offSum = 0, offCnt = 0;
+        for (let i = 0; i < N; i++) {
           const j = i * 4;
-          const diff = Math.abs(d[j] - bg[j]) + Math.abs(d[j + 1] - bg[j + 1]) + Math.abs(d[j + 2] - bg[j + 2]);
+          const dl = (d[j] + d[j + 1] + d[j + 2]) - (bgSmall[j] + bgSmall[j + 1] + bgSmall[j + 2]);
+          if (Math.abs(dl) < CFG.diffThreshold) { offSum += dl; offCnt++; }
+        }
+        const off = offCnt ? offSum / offCnt / 3 : 0;
+
+        // pass 2: threshold with compensation
+        for (let i = 0; i < N; i++) {
+          const j = i * 4;
+          const diff =
+            Math.abs(d[j] - bgSmall[j] - off) +
+            Math.abs(d[j + 1] - bgSmall[j + 1] - off) +
+            Math.abs(d[j + 2] - bgSmall[j + 2] - off);
           raw[i] = diff > CFG.diffThreshold ? 1 : 0;
         }
-        dilate(raw, tmp, mask, W, H, CFG.dilateRadius);
-        for (let i = 0; i < W * H; i++) {
-          if (mask[i] && noise[i] < state.progress) {
-            const j = i * 4;
-            d[j] = bg[j]; d[j + 1] = bg[j + 1]; d[j + 2] = bg[j + 2];
-          }
+        morph(raw, tmp, eroded, aw, ah, CFG.erodeRadius, false);   // kill speckles
+        morph(eroded, tmp, mask, aw, ah, CFG.dilateRadius, true);  // cover edges
+
+        const a = maskImg.data;
+        for (let i = 0; i < N; i++) {
+          a[i * 4 + 3] = mask[i] && noise[i] < state.progress ? 255 : 0;
         }
+        maskCtx.putImageData(maskImg, 0, 0);
+
+        // cut the full-res background with the (smoothly upscaled) mask
+        layer.globalCompositeOperation = 'copy';
+        layer.drawImage(bgCv, 0, 0, W, H);
+        layer.globalCompositeOperation = 'destination-in';
+        layer.imageSmoothingEnabled = true;
+        layer.imageSmoothingQuality = 'high';
+        layer.drawImage(maskCv, 0, 0, W, H);
+        layer.globalCompositeOperation = 'source-over';
+
+        out.drawImage(layerCv, 0, 0, W, H);
       }
-      ctx.putImageData(frame, 0, 0);
     }
 
     // setInterval (not rAF) so it keeps running if the tab is in background
-    const timer = setInterval(tick, 1000 / 30);
+    const timer = setInterval(tick, 1000 / CFG.fps);
 
-    const outTrack = canvas.captureStream(30).getVideoTracks()[0];
+    const outTrack = outCv.captureStream(CFG.fps).getVideoTracks()[0];
     const origStop = outTrack.stop.bind(outTrack);
-    outTrack.stop = () => {            // release the real camera when Meet stops us
+    outTrack.stop = () => {
       origStop();
       videoTrack.stop();
       clearInterval(timer);
@@ -207,7 +256,7 @@
     const api = {
       track: outTrack,
       startCapture,
-      hasBackground: () => !!bg,
+      hasBackground: () => !!bgSmall,
     };
     return api;
   }
@@ -225,6 +274,7 @@
         if (!vt) return stream;
         const proc = createProcessor(vt);
         currentProcessor = proc;
+        setTimeout(() => toast(`Vanish Cam ready: ${MOD}+B = background, ${MOD}+V = vanish`), 500);
         return new MediaStream([proc.track, ...audio]);
       } catch (e) {
         console.error('[VanishCam] failed, falling back to real stream', e);
@@ -233,10 +283,15 @@
     };
   }
 
-  // ---------- hotkeys ----------
+  // ---------- hotkeys (e.code => works on Mac Option key too) ----------
   window.addEventListener('keydown', (e) => {
-    if (!e.altKey || !e.shiftKey) return;
-    if (e.code === 'KeyB' && currentProcessor) currentProcessor.startCapture();
-    if (e.code === 'KeyV') toggleVanish();
-  });
+    if (!e.altKey || !e.shiftKey) return; // altKey = Option on Mac
+    if (e.code === 'KeyB' && currentProcessor) {
+      e.preventDefault();
+      currentProcessor.startCapture();
+    } else if (e.code === 'KeyV') {
+      e.preventDefault();
+      toggleVanish();
+    }
+  }, true);
 })();
